@@ -1,11 +1,15 @@
 """
-XVIP Hybrid Telegram Bot
-========================
-Userbot (Pyrogram) + Bot API (python-telegram-bot) running concurrently.
+XVIP Hybrid Bot — Self-Setup Mode
+===================================
+Pehli baar: Bot khud phone/OTP/2FA maangega aur STRING_SESSION save karega.
+Uske baad: Normal userbot+admin mode mein kaam karega.
 
-Flow:
-  Source Channel → Userbot detects post → forwards to Converter Bot DM
-  → Converter Bot replies → Userbot catches reply → sends to Destination
+ENV VARS (Railway):
+  API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS
+  TERA_SOURCE_CHANNELS, DISK_SOURCE_CHANNELS
+  TERA_CONVERTER_BOT, DISK_CONVERTER_BOT
+  TERA_DESTINATION, DISK_DESTINATION
+  STRING_SESSION  ← optional, agar pehle se hai to setup skip hoga
 """
 
 import asyncio
@@ -14,225 +18,373 @@ import os
 import time
 from typing import Optional
 
-from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, PeerIdInvalid, RPCError
-from pyrogram.types import Message
+from pyrogram import Client, filters as pyro_filters
+from pyrogram.errors import (
+    FloodWait, PeerIdInvalid, RPCError,
+    PhoneNumberInvalid, PhoneCodeInvalid,
+    PhoneCodeExpired, SessionPasswordNeeded,
+)
+from pyrogram.types import Message as PyroMessage
 
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, ConversationHandler, filters,
 )
 
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%H:%M:%S",
     level=logging.INFO,
 )
-logger = logging.getLogger("xvip-bot")
+logger = logging.getLogger("xvip")
 
 # ─────────────────────────────────────────────
-# ENVIRONMENT VARIABLES
+# ENV HELPERS
 # ─────────────────────────────────────────────
 def _require(key: str) -> str:
     val = os.environ.get(key, "").strip()
     if not val:
-        raise EnvironmentError(f"Missing required environment variable: {key}")
+        raise EnvironmentError(f"Missing env var: {key}")
     return val
 
+def _optional(key: str) -> str:
+    return os.environ.get(key, "").strip()
+
 def _parse_int_list(raw: str) -> list[int]:
-    """Parse comma-separated numeric channel IDs into list of ints."""
     result = []
-    for part in raw.split(","):
-        part = part.strip()
-        if part:
+    for p in raw.split(","):
+        p = p.strip()
+        if p:
             try:
-                result.append(int(part))
+                result.append(int(p))
             except ValueError:
-                logger.warning(f"Skipping invalid channel ID: {part!r}")
+                logger.warning(f"Invalid channel ID skipped: {p!r}")
     return result
 
-def _parse_id_set(raw: str) -> set[int]:
-    return set(_parse_int_list(raw))
+# ─────────────────────────────────────────────
+# LOAD ENV
+# ─────────────────────────────────────────────
+API_ID   = int(_require("API_ID"))
+API_HASH = _require("API_HASH")
+BOT_TOKEN = _require("BOT_TOKEN")
+ADMIN_IDS: set[int] = set(_parse_int_list(_require("ADMIN_IDS")))
 
-# ── Required ──
-API_ID          = int(_require("API_ID"))
-API_HASH        = _require("API_HASH")
-BOT_TOKEN       = _require("BOT_TOKEN")
-STRING_SESSION  = _require("STRING_SESSION")
+TERA_SOURCE_IDS: list[int] = _parse_int_list(_optional("TERA_SOURCE_CHANNELS"))
+DISK_SOURCE_IDS: list[int] = _parse_int_list(_optional("DISK_SOURCE_CHANNELS"))
+TERA_SOURCE_SET  = set(TERA_SOURCE_IDS)
+DISK_SOURCE_SET  = set(DISK_SOURCE_IDS)
 
-ADMIN_IDS: set[int] = _parse_id_set(_require("ADMIN_IDS"))
+TERA_CONVERTER_BOT = _optional("TERA_CONVERTER_BOT").lstrip("@")
+DISK_CONVERTER_BOT = _optional("DISK_CONVERTER_BOT").lstrip("@")
+TERA_DESTINATION   = _optional("TERA_DESTINATION")
+DISK_DESTINATION   = _optional("DISK_DESTINATION")
 
-TERA_SOURCE_IDS: list[int] = _parse_int_list(_require("TERA_SOURCE_CHANNELS"))
-DISK_SOURCE_IDS: list[int] = _parse_int_list(_require("DISK_SOURCE_CHANNELS"))
+# STRING_SESSION — may or may not exist at startup
+STORED_SESSION = _optional("STRING_SESSION")
 
-TERA_CONVERTER_BOT: str = _require("TERA_CONVERTER_BOT").lstrip("@")
-DISK_CONVERTER_BOT: str = _require("DISK_CONVERTER_BOT").lstrip("@")
-
-TERA_DESTINATION: str = _require("TERA_DESTINATION")
-DISK_DESTINATION: str = _require("DISK_DESTINATION")
-
-# ── Derived sets for fast lookup ──
-TERA_SOURCE_SET: set[int] = set(TERA_SOURCE_IDS)
-DISK_SOURCE_SET: set[int] = set(DISK_SOURCE_IDS)
-
-# ── Global state ──
+# ─────────────────────────────────────────────
+# GLOBAL STATE
+# ─────────────────────────────────────────────
+userbot: Optional[Client] = None
 userbot_connected: bool = False
-START_TIME: float = time.time()
+START_TIME = time.time()
+
+# Setup conversation temp storage
+setup_state: dict = {}   # keyed by admin user_id
+
+# Conversation states
+SETUP_PHONE, SETUP_OTP, SETUP_2FA = range(3)
 
 # ─────────────────────────────────────────────
-# HELPERS
+# USERBOT HELPERS
 # ─────────────────────────────────────────────
-def _has_media(msg: Message) -> bool:
-    """Return True if message contains photo or video."""
+def _has_media(msg: PyroMessage) -> bool:
     return bool(msg.photo or msg.video)
 
 def _contains_tera(text: Optional[str]) -> bool:
-    if not text:
-        return False
+    if not text: return False
     t = text.lower()
     return "tera" in t or "terabox" in t
 
 def _contains_disk(text: Optional[str]) -> bool:
-    if not text:
-        return False
+    if not text: return False
     t = text.lower()
     return "disk" in t or "1drv" in t or "onedrive" in t
 
-async def _send_with_retry(
-    userbot: Client,
-    chat: str | int,
-    *,
-    forward_msg: Optional[Message] = None,
-    text: Optional[str] = None,
-    retries: int = 3,
-) -> Optional[Message]:
-    """Send or forward a message with FloodWait retry logic."""
+async def _send_retry(client: Client, chat, *, fwd_msg=None, text=None, retries=3):
     for attempt in range(retries):
         try:
-            if forward_msg:
-                return await userbot.forward_messages(
+            if fwd_msg:
+                return await client.forward_messages(
                     chat_id=chat,
-                    from_chat_id=forward_msg.chat.id,
-                    message_ids=forward_msg.id,
+                    from_chat_id=fwd_msg.chat.id,
+                    message_ids=fwd_msg.id,
                 )
             elif text:
-                return await userbot.send_message(chat_id=chat, text=text)
+                return await client.send_message(chat_id=chat, text=text)
         except FloodWait as e:
-            wait = e.value + 2
-            logger.warning(f"FloodWait: sleeping {wait}s (attempt {attempt+1}/{retries})")
-            await asyncio.sleep(wait)
+            await asyncio.sleep(e.value + 2)
         except PeerIdInvalid:
-            logger.error(f"PeerIdInvalid for chat={chat!r}. Check IDs/usernames.")
+            logger.error(f"PeerIdInvalid: {chat!r}")
             return None
         except RPCError as e:
-            logger.error(f"RPC error on attempt {attempt+1}: {e}")
+            logger.error(f"RPC error: {e}")
             await asyncio.sleep(2 ** attempt)
-    logger.error(f"Failed to send to {chat!r} after {retries} attempts.")
     return None
 
-# ─────────────────────────────────────────────
-# DESTINATION RESOLVER
-# ─────────────────────────────────────────────
-async def _resolve_destination(userbot: Client, dest: str) -> int | str:
-    """
-    Accept numeric string, -100xxx integer string, or @username / bot username.
-    Returns int if numeric, else str username.
-    """
+def _resolve_dest(dest: str):
     dest = dest.strip()
     try:
         return int(dest)
     except ValueError:
-        # username with or without @
         return dest.lstrip("@")
 
 # ─────────────────────────────────────────────
-# PYROGRAM USERBOT
+# REGISTER USERBOT HANDLERS
 # ─────────────────────────────────────────────
-def build_userbot() -> Client:
-    return Client(
-        name="xvip_userbot",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=STRING_SESSION,
-        in_memory=True,
-    )
+def register_userbot_handlers(ub: Client) -> None:
+    all_sources = TERA_SOURCE_IDS + DISK_SOURCE_IDS
+    if not all_sources:
+        logger.warning("No source channels configured!")
+        return
 
-def register_userbot_handlers(userbot: Client) -> None:
-
-    all_source_ids = TERA_SOURCE_IDS + DISK_SOURCE_IDS
-
-    # ── STEP A + B: Monitor source channels ──
-    @userbot.on_message(filters.chat(all_source_ids) & filters.incoming)
-    async def on_source_post(client: Client, msg: Message) -> None:
+    @ub.on_message(pyro_filters.chat(all_sources) & pyro_filters.incoming)
+    async def on_source_post(client: Client, msg: PyroMessage):
         chat_id = msg.chat.id
         caption = msg.caption or msg.text or ""
 
-        logger.info(f"[SOURCE] chat={chat_id} | has_media={_has_media(msg)} | caption_len={len(caption)}")
-
-        # STEP B1: media check
         if not _has_media(msg):
-            logger.debug(f"[DROP] No media in post from {chat_id}")
             return
 
-        # STEP B2: keyword + source alignment
         if chat_id in TERA_SOURCE_SET:
             if not _contains_tera(caption):
-                logger.debug(f"[DROP] Tera source but no tera keyword: {chat_id}")
                 return
-            logger.info(f"[FORWARD→TERA_BOT] Forwarding msg {msg.id} to @{TERA_CONVERTER_BOT}")
-            await _send_with_retry(client, TERA_CONVERTER_BOT, forward_msg=msg)
+            if TERA_CONVERTER_BOT:
+                logger.info(f"[TERA] Forwarding to @{TERA_CONVERTER_BOT}")
+                await _send_retry(client, TERA_CONVERTER_BOT, fwd_msg=msg)
 
         elif chat_id in DISK_SOURCE_SET:
             if not _contains_disk(caption):
-                logger.debug(f"[DROP] Disk source but no disk keyword: {chat_id}")
                 return
-            logger.info(f"[FORWARD→DISK_BOT] Forwarding msg {msg.id} to @{DISK_CONVERTER_BOT}")
-            await _send_with_retry(client, DISK_CONVERTER_BOT, forward_msg=msg)
+            if DISK_CONVERTER_BOT:
+                logger.info(f"[DISK] Forwarding to @{DISK_CONVERTER_BOT}")
+                await _send_retry(client, DISK_CONVERTER_BOT, fwd_msg=msg)
 
-        else:
-            logger.warning(f"[UNEXPECTED] chat_id {chat_id} not in any source set")
-
-    # ── STEP C + D: Intercept converter bot replies ──
-    @userbot.on_message(
-        filters.private
-        & filters.incoming
-        & filters.reply
-    )
-    async def on_converter_reply(client: Client, msg: Message) -> None:
-        sender = msg.chat.username or ""
-        sender_clean = sender.lstrip("@").lower()
-
-        is_tera = sender_clean == TERA_CONVERTER_BOT.lower()
-        is_disk = sender_clean == DISK_CONVERTER_BOT.lower()
+    @ub.on_message(pyro_filters.private & pyro_filters.incoming & pyro_filters.reply)
+    async def on_converter_reply(client: Client, msg: PyroMessage):
+        sender = (msg.chat.username or "").lstrip("@").lower()
+        is_tera = sender == TERA_CONVERTER_BOT.lower() if TERA_CONVERTER_BOT else False
+        is_disk = sender == DISK_CONVERTER_BOT.lower() if DISK_CONVERTER_BOT else False
 
         if not (is_tera or is_disk):
-            return  # not from our converter bots
-
-        logger.info(f"[CONVERTER_REPLY] From={sender} is_tera={is_tera} is_disk={is_disk}")
+            return
 
         dest_raw = TERA_DESTINATION if is_tera else DISK_DESTINATION
-        dest = await _resolve_destination(client, dest_raw)
+        if not dest_raw:
+            return
 
+        dest = _resolve_dest(dest_raw)
         label = "TERA" if is_tera else "DISK"
-        logger.info(f"[DISPATCH→{label}] Sending converted post to {dest!r}")
-
-        await _send_with_retry(client, dest, forward_msg=msg)
+        logger.info(f"[{label}] Converted reply → {dest!r}")
+        await _send_retry(client, dest, fwd_msg=msg)
 
 
 # ─────────────────────────────────────────────
-# PTB BOT (ADMIN INTERFACE)
+# START USERBOT
+# ─────────────────────────────────────────────
+async def start_userbot(session_string: str) -> bool:
+    global userbot, userbot_connected
+    try:
+        ub = Client(
+            name="xvip_userbot",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session_string,
+            in_memory=True,
+        )
+        register_userbot_handlers(ub)
+        await ub.start()
+        me = await ub.get_me()
+        userbot = ub
+        userbot_connected = True
+        logger.info(f"✅ Userbot started: {me.first_name} ({me.id})")
+        return True
+    except Exception as e:
+        logger.error(f"Userbot start failed: {e}")
+        userbot_connected = False
+        return False
+
+
+# ─────────────────────────────────────────────
+# SETUP CONVERSATION — Phone/OTP/2FA
+# ─────────────────────────────────────────────
+async def setup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return ConversationHandler.END
+
+    if userbot_connected:
+        await update.message.reply_text("✅ Userbot already connected hai! /status dekho.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "📱 *Userbot Setup*\n\n"
+        "Apna Telegram phone number bhejo:\n"
+        "Format: `+919876543210`",
+        parse_mode="Markdown",
+    )
+    return SETUP_PHONE
+
+
+async def setup_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    phone = update.message.text.strip()
+
+    await update.message.reply_text(f"⏳ `{phone}` pe OTP bhej raha hoon...", parse_mode="Markdown")
+
+    try:
+        client = Client(f"setup_{uid}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
+        await client.connect()
+        sent = await client.send_code(phone)
+
+        setup_state[uid] = {
+            "client": client,
+            "phone": phone,
+            "phone_code_hash": sent.phone_code_hash,
+        }
+
+        await update.message.reply_text(
+            "✅ OTP bheja gaya!\n\nTelegram se aaya *5-digit code* bhejo:",
+            parse_mode="Markdown",
+        )
+        return SETUP_OTP
+
+    except PhoneNumberInvalid:
+        await update.message.reply_text("❌ Invalid number. /setup se dobara karo.")
+        return ConversationHandler.END
+    except FloodWait as e:
+        await update.message.reply_text(f"⏳ FloodWait: {e.value}s baad try karo.")
+        return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: `{e}`\n\n/setup se dobara karo.", parse_mode="Markdown")
+        return ConversationHandler.END
+
+
+async def setup_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    otp = update.message.text.strip().replace(" ", "")
+    state = setup_state.get(uid)
+
+    if not state:
+        await update.message.reply_text("❌ Session expired. /setup se dobara karo.")
+        return ConversationHandler.END
+
+    client   = state["client"]
+    phone    = state["phone"]
+    ph_hash  = state["phone_code_hash"]
+
+    try:
+        await client.sign_in(phone, ph_hash, otp)
+        session_string = await client.export_session_string()
+        await client.disconnect()
+        setup_state.pop(uid, None)
+
+        ok = await start_userbot(session_string)
+
+        if ok:
+            await update.message.reply_text(
+                "🎉 *Setup Complete!*\n\n"
+                "Userbot connected ho gaya!\n\n"
+                "⚠️ *Important:* Ye session string Railway mein `STRING_SESSION` variable mein save karo "
+                "taaki restart pe dobara setup na karna pade:\n\n"
+                f"`{session_string}`",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("❌ Userbot start nahi hua. /setup se dobara try karo.")
+        return ConversationHandler.END
+
+    except PhoneCodeInvalid:
+        await update.message.reply_text("❌ Wrong OTP. Sahi code bhejo:")
+        return SETUP_OTP
+
+    except PhoneCodeExpired:
+        await update.message.reply_text("❌ OTP expire ho gaya. /setup se dobara karo.")
+        setup_state.pop(uid, None)
+        return ConversationHandler.END
+
+    except SessionPasswordNeeded:
+        await update.message.reply_text(
+            "🔐 *Two-Step Verification*\n\n2FA password bhejo:",
+            parse_mode="Markdown",
+        )
+        setup_state[uid]["session_pending"] = True
+        return SETUP_2FA
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+        setup_state.pop(uid, None)
+        return ConversationHandler.END
+
+
+async def setup_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    password = update.message.text.strip()
+    state = setup_state.get(uid)
+
+    if not state:
+        await update.message.reply_text("❌ Session expired. /setup se dobara karo.")
+        return ConversationHandler.END
+
+    client = state["client"]
+
+    try:
+        await client.check_password(password)
+        session_string = await client.export_session_string()
+        await client.disconnect()
+        setup_state.pop(uid, None)
+
+        ok = await start_userbot(session_string)
+
+        if ok:
+            await update.message.reply_text(
+                "🎉 *Setup Complete!*\n\n"
+                "Userbot connected ho gaya!\n\n"
+                "⚠️ *Important:* Ye string Railway `STRING_SESSION` mein save karo:\n\n"
+                f"`{session_string}`",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("❌ Userbot start nahi hua. /setup se dobara try karo.")
+        return ConversationHandler.END
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Wrong password: `{e}`\n\nDobara bhejo:", parse_mode="Markdown")
+        return SETUP_2FA
+
+
+async def setup_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    state = setup_state.pop(uid, None)
+    if state:
+        try:
+            await state["client"].disconnect()
+        except Exception:
+            pass
+    await update.message.reply_text("❌ Setup cancelled.")
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
+# ADMIN COMMANDS
 # ─────────────────────────────────────────────
 def admin_only(func):
-    """Decorator: silently ignore non-admins."""
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else None
-        if uid not in ADMIN_IDS:
-            logger.debug(f"[ADMIN_GUARD] Blocked user {uid}")
+        if (update.effective_user.id if update.effective_user else None) not in ADMIN_IDS:
             return
         return await func(update, ctx)
     wrapper.__name__ = func.__name__
@@ -240,115 +392,106 @@ def admin_only(func):
 
 
 @admin_only
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uptime_s = int(time.time() - START_TIME)
-    h, rem = divmod(uptime_s, 3600)
-    m, s = divmod(rem, 60)
-    text = (
-        "🤖 <b>XVIP Hybrid Bot</b> — Active\n\n"
-        f"⏱ Uptime: <code>{h:02d}:{m:02d}:{s:02d}</code>\n\n"
-        "Commands:\n"
-        "  /status — Live config breakdown\n"
-        "  /test   — Ping userbot session\n"
-        "  /menu   — This menu"
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uptime = int(time.time() - START_TIME)
+    h, r = divmod(uptime, 3600); m, s = divmod(r, 60)
+    ub = "✅ Connected" if userbot_connected else "❌ Not connected — /setup karo"
+    await update.message.reply_html(
+        f"🤖 <b>XVIP Hybrid Bot</b>\n\n"
+        f"⏱ Uptime: <code>{h:02d}:{m:02d}:{s:02d}</code>\n"
+        f"📡 Userbot: {ub}\n\n"
+        f"Commands:\n"
+        f"  /setup  — Userbot connect karo\n"
+        f"  /status — Config dekho\n"
+        f"  /test   — Ping userbot"
     )
-    await update.message.reply_html(text)
 
 
 @admin_only
-async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await cmd_start(update, ctx)
-
-
-@admin_only
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    ub_status = "✅ Connected" if userbot_connected else "❌ Disconnected"
-
-    tera_ids_fmt = "\n".join(f"  • <code>{i}</code>" for i in TERA_SOURCE_IDS) or "  (none)"
-    disk_ids_fmt = "\n".join(f"  • <code>{i}</code>" for i in DISK_SOURCE_IDS) or "  (none)"
-
-    text = (
-        f"📊 <b>Live Status</b>\n\n"
-        f"<b>Userbot:</b> {ub_status}\n\n"
-        f"━━━━━━ TERA ━━━━━━\n"
-        f"<b>Source Channels:</b>\n{tera_ids_fmt}\n"
-        f"<b>Converter Bot:</b> @{TERA_CONVERTER_BOT}\n"
-        f"<b>Destination:</b> <code>{TERA_DESTINATION}</code>\n\n"
-        f"━━━━━━ DISK ━━━━━━\n"
-        f"<b>Source Channels:</b>\n{disk_ids_fmt}\n"
-        f"<b>Converter Bot:</b> @{DISK_CONVERTER_BOT}\n"
-        f"<b>Destination:</b> <code>{DISK_DESTINATION}</code>"
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ub = "✅ Connected" if userbot_connected else "❌ Disconnected"
+    t_ids = "\n".join(f"  • <code>{i}</code>" for i in TERA_SOURCE_IDS) or "  (none)"
+    d_ids = "\n".join(f"  • <code>{i}</code>" for i in DISK_SOURCE_IDS) or "  (none)"
+    await update.message.reply_html(
+        f"📊 <b>Status</b>\n\n"
+        f"<b>Userbot:</b> {ub}\n\n"
+        f"━━━ TERA ━━━\n"
+        f"<b>Sources:</b>\n{t_ids}\n"
+        f"<b>Converter:</b> @{TERA_CONVERTER_BOT or '—'}\n"
+        f"<b>Destination:</b> <code>{TERA_DESTINATION or '—'}</code>\n\n"
+        f"━━━ DISK ━━━\n"
+        f"<b>Sources:</b>\n{d_ids}\n"
+        f"<b>Converter:</b> @{DISK_CONVERTER_BOT or '—'}\n"
+        f"<b>Destination:</b> <code>{DISK_DESTINATION or '—'}</code>"
     )
-    await update.message.reply_html(text)
 
 
 @admin_only
-async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("🏓 Pinging userbot…")
+async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not userbot_connected or not userbot:
+        await update.message.reply_text("❌ Userbot connected nahi. /setup karo.")
+        return
     try:
-        app: Client = ctx.bot_data["userbot"]
-        me = await app.get_me()
+        me = await userbot.get_me()
         await update.message.reply_html(
             f"✅ <b>Userbot OK</b>\n"
-            f"Logged in as: <code>{me.first_name}</code> (<code>{me.id}</code>)"
+            f"Name: <code>{me.first_name}</code>\n"
+            f"ID: <code>{me.id}</code>"
         )
     except Exception as e:
-        await update.message.reply_html(f"❌ <b>Userbot error:</b> <code>{e}</code>")
-
-
-def build_ptb_app(userbot: Client) -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.bot_data["userbot"] = userbot
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("menu",  cmd_menu))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("test",  cmd_test))
-
-    return app
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
 # ─────────────────────────────────────────────
-# ENTRYPOINT
+# MAIN
 # ─────────────────────────────────────────────
-async def main() -> None:
-    global userbot_connected
+async def main():
+    # Build PTB app
+    ptb = Application.builder().token(BOT_TOKEN).build()
 
-    userbot = build_userbot()
-    register_userbot_handlers(userbot)
-
-    ptb_app = build_ptb_app(userbot)
-
-    logger.info("Starting userbot…")
-    await userbot.start()
-    userbot_connected = True
-    me = await userbot.get_me()
-    logger.info(f"Userbot logged in as: {me.first_name} ({me.id})")
-
-    logger.info("Starting PTB bot…")
-    await ptb_app.initialize()
-    await ptb_app.start()
-    await ptb_app.updater.start_polling(drop_pending_updates=True)
-
-    logger.info(
-        f"✅ Bot running | "
-        f"Tera sources: {TERA_SOURCE_IDS} | "
-        f"Disk sources: {DISK_SOURCE_IDS}"
+    # Setup conversation
+    setup_conv = ConversationHandler(
+        entry_points=[CommandHandler("setup", setup_start)],
+        states={
+            SETUP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_phone)],
+            SETUP_OTP:   [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_otp)],
+            SETUP_2FA:   [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_2fa)],
+        },
+        fallbacks=[CommandHandler("cancel", setup_cancel)],
+        per_user=True,
+        per_chat=True,
     )
 
-    # Run until Ctrl-C / SIGTERM
+    ptb.add_handler(CommandHandler("start",  cmd_start))
+    ptb.add_handler(CommandHandler("menu",   cmd_start))
+    ptb.add_handler(CommandHandler("status", cmd_status))
+    ptb.add_handler(CommandHandler("test",   cmd_test))
+    ptb.add_handler(setup_conv)
+
+    # Auto-start userbot if session already exists
+    if STORED_SESSION:
+        logger.info("STRING_SESSION found — auto-starting userbot...")
+        await start_userbot(STORED_SESSION)
+    else:
+        logger.info("No STRING_SESSION — admin ko /setup karna hoga bot pe.")
+
+    # Start PTB
+    await ptb.initialize()
+    await ptb.start()
+    await ptb.updater.start_polling(drop_pending_updates=True)
+    logger.info("✅ Bot running!")
+
     try:
         await asyncio.Event().wait()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        logger.info("Shutting down…")
-        await ptb_app.updater.stop()
-        await ptb_app.stop()
-        await ptb_app.shutdown()
-        await userbot.stop()
-        userbot_connected = False
-        logger.info("Stopped cleanly.")
+        await ptb.updater.stop()
+        await ptb.stop()
+        await ptb.shutdown()
+        if userbot:
+            await userbot.stop()
+        logger.info("Stopped.")
 
 
 if __name__ == "__main__":
