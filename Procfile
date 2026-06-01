@@ -1,1 +1,1 @@
-worker: python main.py
+worker: python session_gen.py
